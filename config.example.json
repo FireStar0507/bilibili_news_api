@@ -1,0 +1,10 @@
+{
+  "sessdata": "replace-me",
+  "talker_id": 0,
+  "session_type": 1,
+  "size": 20,
+  "request_interval_sec": 1.5,
+  "max_round": 10,
+  "archive_dir": ".",
+  "retry_times": 3
+}
