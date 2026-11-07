@@ -294,18 +294,19 @@ relative_path = f"{year}/{month:02d}/{span}/{seqno}{extension}"
 ### 8. incremental_sync (`src/sync_incremental.py`)
 
 ```text
-local_max = db.get_max_seqno(talker_id) or 0
+anchor = db.get_max_seqno(talker_id) or 0
+begin = None
 loop:
-    result = client.fetch(...)          # 不传 begin_seqno
-    newer = [m for m in result.messages if m.seqno > local_max]
-    if newer 为空:
-        break
+    result = client.fetch(..., begin_seqno=begin)
+    newer = [m for m in result.messages if m.seqno > anchor]
+    if newer 为空: break
     persist newer
-    local_max = max(local_max, max seqno in newer)
-    等待 request_interval
+    if anchor == 0: break          # 空库只收最新一批，历史交给 backfill
+    if result.min_seqno <= anchor: break
+    begin = result.min_seqno       # 倒序向前直到与本地重叠
 ```
 
-接口只倒序返回最新一批，增量侧用循环追平空洞：每轮仍不传 `begin_seqno`，只吃 `seqno > local_max` 的消息，直到本批全是旧消息。不读写 `resume_point.json`，不调用回溯。
+空库只收最新一批。已有本地数据时，从最新批沿 `begin_seqno=min_seqno` 向前追到与 `anchor` 重叠，填上空洞。不读写 `resume_point.json`，不调用回溯。
 
 ### 9. backfill_history (`src/sync_backfill.py`)
 
