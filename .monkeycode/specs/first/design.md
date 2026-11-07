@@ -5,16 +5,17 @@ Updated: 2026-11-07
 
 ## Description
 
-本方案实现一个面向个人学习测试的本地归档工具：通过 B 站 `fetch_session_msgs` 接口拉取指定会话私信，将元数据写入 SQLite，将图片按 10 天存储桶落地到本地，并提供离线查阅。
+本方案实现一个面向个人学习测试的归档工具：通过 B 站 `fetch_session_msgs` 拉取指定会话私信，元数据写入仓库内 SQLite，图片按 `年/月/旬` 写入仓库。v1 只记录，不实现查阅。
 
 设计目标：
 
-1. 增量同步高频、轻量、稳定收录新消息。
-2. 回溯补历史低频、分批、可断点续跑，覆盖 10 万级历史。
-3. 两条流程互相独立，共享同一套存储与解析层。
-4. 存档格式与既定规范完全兼容：表结构、图片桶、断点文件、去重与排序规则均不可改。
+1. 增量同步循环追平本地最大 seqno 之后的全部新消息。
+2. 回溯补历史低频、分批、可断点续跑。
+3. 两条流程互相独立，共享存储与解析层。
+4. GitHub Actions 每日跑增量，把 db / 图片 / 断点提交回仓库。
+5. 本仓库无旧存档，图片路径采用新分层：`{YYYY}/{MM}/{01-10|11-20|21-月末}/{seqno}.ext`。
 
-技术选型：Python 3.11+ 标准库 `sqlite3` + `urllib`/`http.client` 或 `requests`，无强制 GUI 依赖。命令行入口覆盖同步、回溯、查阅。
+技术选型：Python 3.11+，`sqlite3` + `urllib`。CLI 仅 `sync` / `backfill` / `status`。
 
 ## Architecture
 
@@ -23,9 +24,9 @@ Updated: 2026-11-07
 ```mermaid
 graph TD
     CLI["CLI 入口"]
-    Inc["incremental_sync"]
+    GHA["GitHub Actions cron"]
+    Inc["incremental_sync 追平"]
     Back["backfill_history"]
-    Reader["本地查阅"]
     Client["SessionMsgClient"]
     Parser["MessageParser"]
     Img["ImageStore"]
@@ -33,12 +34,12 @@ graph TD
     Resume["ResumePointStore"]
     API["Bilibili fetch_session_msgs"]
     DiskDB["bilibili_msg_archive.db"]
-    DiskImg["msg_images/"]
+    DiskImg["YYYY/MM/旬/"]
     DiskResume["resume_point.json"]
 
+    GHA --> CLI
     CLI --> Inc
     CLI --> Back
-    CLI --> Reader
     Inc --> Client
     Back --> Client
     Inc --> Parser
@@ -46,12 +47,12 @@ graph TD
     Parser --> Img
     Parser --> DB
     Back --> Resume
-    Reader --> DB
-    Reader --> DiskImg
     Client --> API
     DB --> DiskDB
     Img --> DiskImg
     Resume --> DiskResume
+    GHA --> DiskDB
+    GHA --> DiskImg
 ```
 
 增量同步数据流：
@@ -67,11 +68,13 @@ sequenceDiagram
     User->>Inc: 启动增量同步
     Inc->>DB: 查询当前会话 MAX seqno
     DB-->>Inc: local_max_seqno
-    Inc->>API: fetch without begin_seqno
-    API-->>Inc: messages plus min_seqno max_seqno
-    Inc->>Inc: 过滤 seqno 大于 local_max_seqno
-    Inc->>Parser: 逐条解析并入库
-    Parser-->>Inc: inserted_count skipped_count
+    loop 本批仍有 seqno 大于 local_max
+        Inc->>API: fetch without begin_seqno
+        API-->>Inc: messages plus min_seqno max_seqno
+        Inc->>Inc: 过滤 seqno 大于 local_max_seqno
+        Inc->>Parser: 逐条解析并入库
+        Inc->>Inc: 更新 local_max 并等待请求间隔
+    end
 ```
 
 回溯补历史数据流：
@@ -123,8 +126,7 @@ sequenceDiagram
 │   ├── image_store.py
 │   ├── resume.py
 │   ├── sync_incremental.py
-│   ├── sync_backfill.py
-│   └── reader.py
+│   └── sync_backfill.py
 ├── tests/
 │   ├── test_parser.py
 │   ├── test_image_store.py
@@ -132,10 +134,10 @@ sequenceDiagram
 │   ├── test_resume.py
 │   ├── test_sync_incremental.py
 │   └── test_sync_backfill.py
-└── archive/                    # 运行时数据根，可配置
-    ├── bilibili_msg_archive.db
-    ├── msg_images/
-    └── resume_point.json
+├── .github/workflows/archive.yml
+├── bilibili_msg_archive.db
+├── resume_point.json
+└── {YYYY}/{MM}/{01-10|11-20|21-月末}/
 ```
 
 ## Components and Interfaces
@@ -146,12 +148,11 @@ sequenceDiagram
 
 | 命令 | 作用 | 读写 resume_point.json |
 |------|------|------------------------|
-| `sync` | 增量同步 | 否 |
+| `sync` | 增量追平 | 否 |
 | `backfill` | 回溯补历史 | 是 |
-| `read` | 本地查阅 | 否 |
 | `status` | 打印本地最大 seqno、消息总数、断点状态 | 只读 |
 
-`sync` 与 `backfill` 作为两个独立子命令，进程内不同时调用。使用者可用 cron / 手动分别调度。
+`sync` 与 `backfill` 作为两个独立子命令，进程内不同时调用。v1 不实现 `read`。GitHub Actions 每日调度 `sync`。
 
 ### 2. Config (`src/config.py`)
 
@@ -165,7 +166,7 @@ sequenceDiagram
 | `size` | int | 20 | 单次拉取条数，上限 200 |
 | `request_interval_sec` | float | 1.5 | 请求最短间隔 |
 | `max_round` | int | 10 | 回溯本轮最大批次数 |
-| `archive_dir` | string | `./archive` | 存档根目录 |
+| `archive_dir` | string | 仓库根 `.` | db、断点、图片均相对仓库根 |
 | `retry_times` | int | 3 | 单次请求网络失败重试次数 |
 | `user_agent` | string | 桌面浏览器 UA | 请求头 |
 
@@ -254,20 +255,24 @@ CREATE INDEX IF NOT EXISTS idx_private_messages_talker_seqno
 
 ### 6. ImageStore (`src/image_store.py`)
 
-桶算法（UTC，秒级 timestamp）：
+桶算法（UTC 日历，按日归属旬，不跨月）：
 
 ```text
-BUCKET_SECONDS = 10 * 86400
-bucket_index = timestamp // BUCKET_SECONDS
-start_ts = bucket_index * BUCKET_SECONDS
-end_ts = start_ts + BUCKET_SECONDS - 1
-folder = format_utc(start_ts, "%Y-%m-%d") + "~" + format_utc(end_ts, "%Y-%m-%d")
-filename = str(seqno) + extension
-relative_path = folder + "/" + filename
-absolute_path = archive_dir + "/msg_images/" + relative_path
+date = UTC(timestamp)
+year, month, day = date.year, date.month, date.day
+last_day = days_in_month(year, month)
+if day <= 10:
+    span = "01-10"
+elif day <= 20:
+    span = "11-20"
+else:
+    span = "21-" + f"{last_day:02d}"
+relative_path = f"{year}/{month:02d}/{span}/{seqno}{extension}"
 ```
 
-扩展名从 URL 路径或 `imageType` 推断，缺省 `.jpg`。下载时带 `Referer: https://message.bilibili.com/` 以降低防盗链失败率。文件已存在则跳过下载并返回原相对路径。
+示例：`2025/02/01-10/123.jpg`、`2026/12/21-31/456.jpg`。2 月非闰年下旬为 `21-28`。日落入哪一旬按日历日，不做跨月四舍五入。
+
+扩展名从 URL 或 `imageType` 推断，缺省 `.jpg`。下载带 `Referer: https://message.bilibili.com/`。文件已存在则跳过。
 
 ### 7. ResumePointStore (`src/resume.py`)
 
@@ -290,15 +295,17 @@ absolute_path = archive_dir + "/msg_images/" + relative_path
 
 ```text
 local_max = db.get_max_seqno(talker_id) or 0
-result = client.fetch(talker_id, session_type, size)   # 不传 begin_seqno
-for msg in result.messages:
-    if msg.seqno <= local_max:
-        skip
-    else:
-        parser.persist(msg)
+loop:
+    result = client.fetch(...)          # 不传 begin_seqno
+    newer = [m for m in result.messages if m.seqno > local_max]
+    if newer 为空:
+        break
+    persist newer
+    local_max = max(local_max, max seqno in newer)
+    等待 request_interval
 ```
 
-一次进程默认只拉一批最新消息。若一批 `size` 仍盖不住本地最大 seqno 到远端最新之间的空洞，返回 `gap_detected=true`，由使用者再次执行 `sync` 或显式传入 `--until-caught-up` 循环拉取；循环仍遵守请求间隔，且每轮继续只入库 `seqno > local_max`。该循环属于增量流程内部，不调用回溯、不写断点。
+接口只倒序返回最新一批，增量侧用循环追平空洞：每轮仍不传 `begin_seqno`，只吃 `seqno > local_max` 的消息，直到本批全是旧消息。不读写 `resume_point.json`，不调用回溯。
 
 ### 9. backfill_history (`src/sync_backfill.py`)
 
@@ -320,11 +327,16 @@ while rounds < max_round:
 
 首轮无断点时 `begin_seqno` 省略，用返回的 `min_seqno` 作为后续起点。
 
-### 10. Reader (`src/reader.py`)
+### 10. GitHub Actions (`.github/workflows/archive.yml`)
 
-离线只读。`read` 命令按 `ORDER BY seqno ASC` 打印或生成静态 HTML 到 `archive/reader.html`。图片用 `image_local_path` 相对 `msg_images/` 引用。`msg_status=1` 标注为撤回。无 `content_text` 时展示 `raw_content`。
+- cron：每天 UTC 16:00（北京时间 00:00）。
+- `workflow_dispatch`：可选 `job=sync|backfill` 与 `max_round`。
+- 步骤：checkout → Python 3.11 → `pip install -r requirements.txt` → 用 Secrets 注入 `BILI_SESSDATA`、`BILI_TALKER_ID` → `python -m src.cli sync` → 若有变更则 commit + push。
+- 提交文件：`bilibili_msg_archive.db`、`resume_point.json`（仅 backfill 会改）、`YYYY/**` 图片。
+- `SESSDATA` 只进 Secrets，不进仓库。
+- 默认每日只跑增量；回溯走手动触发，避免一次 Actions 打满风控。
 
-本版本不实现导出、代理、图片失败重试队列、多会话管理封装；代码按 `talker_id` 参数化，为后续扩展留口。
+v1 不实现查阅、导出、代理、图片失败重试队列、多会话管理。
 
 ## Data Models
 
@@ -369,7 +381,7 @@ File = dict[str, Record]   # key = str(talker_id)
 必须同时备份：
 
 1. `bilibili_msg_archive.db`
-2. `msg_images/`
+2. `{YYYY}/{MM}/{旬}/` 图片树
 3. `resume_point.json`
 
 缺任一文件即视为不完整备份。
@@ -381,7 +393,7 @@ File = dict[str, Record]   # key = str(talker_id)
 3. **回溯断点单调**: 同一 `talker_id` 的 `last_begin_seqno` 随成功批次递减或保持（接口倒序向前）；`has_finished=true` 之后回溯不再发请求。
 4. **倒序分页语义**: 不传 `begin_seqno` 得到最新一批；传入 `begin_seqno=min_seqno` 得到更早一批，且不含该 `begin_seqno` 自身。
 5. **时序查询**: 聊天先后顺序的唯一合法 SQL 为 `ORDER BY seqno ASC`；`timestamp` 不用于去重或唯一排序。
-6. **图片路径稳定**: 同一 `(timestamp, seqno, ext)` 永远映射到同一相对路径；桶宽固定 10 天，命名 `YYYY-MM-DD~YYYY-MM-DD`。
+6. **图片路径稳定**: 同一 `(timestamp, seqno, ext)` 永远映射到 `{YYYY}/{MM}/{01-10|11-20|21-月末}/{seqno}.ext`。
 7. **图片失败不丢消息**: 下载失败时该行仍插入，`image_local_path` 为 NULL，`raw_content` 完整。
 8. **节流**: 同一进程内两次 `fetch_session_msgs` 的间隔大于等于 `request_interval_sec`。
 9. **凭证失效可观测**: `code=-101` 使当前流程以非 0 退出码结束，并明确提示更新 SESSDATA。
@@ -412,10 +424,10 @@ File = dict[str, Record]   # key = str(talker_id)
 | 模块 | 覆盖点 |
 |------|--------|
 | parser | msg_type=1 提取文本；msg_type=2 提取 url；其他类型 raw 保留；非法 JSON 降级；msg_status=1 仍解析 |
-| image_store | 10 天桶边界（桶起点、桶末秒、跨桶）；相对路径格式；已存在文件跳过 |
+| image_store | 旬边界：1、10、11、20、21、月末；2 月 28/29；相对路径格式；已存在文件跳过 |
 | storage | seqno 重复跳过；`ORDER BY seqno ASC`；timestamp 相同两条仍按 seqno 排序；MAX(seqno) |
 | resume | key 为字符串 talker_id；原子写入；has_finished 后读取 |
-| incremental | 只入库 seqno > local_max；local_max=0 时收下最新批；不调用 ResumePointStore |
+| incremental | 只入库 seqno > local_max；循环直到本批全旧；不调用 ResumePointStore |
 | backfill | 无断点时首批不带 begin_seqno；随后使用 min_seqno；max_round 截断；has_more=0 置 has_finished；与 incremental 无互相调用 |
 
 ### 属性 / 不变量测试
@@ -429,19 +441,20 @@ File = dict[str, Record]   # key = str(talker_id)
 1. 配置个人 SESSDATA 与单一 talker_id，执行 `sync`，确认最新消息入库。
 2. 执行 `backfill --max-round 2`，确认 `resume_point.json` 更新且请求有间隔。
 3. 再次 `backfill` 从断点继续。
-4. 断开网络执行 `read`，确认文本与已下载图片可展示。
-5. 将 SESSDATA 改为无效值，确认 `-101` 停止且数据未损坏。
+4. 将 SESSDATA 改为无效值，确认 `-101` 停止且数据未损坏。
+5. 空跑 Actions 工作流语法与 Secrets 注入路径（不在 CI 打真实接口）。
 
 ## Design Decisions
 
 1. **保留双轨模型**: 增量与回溯解耦，保证“新消息优先稳定收录”。耦合被需求明确禁止。
-2. **单次增量默认一批**: 高频场景下一次请求足够；可选 `--until-caught-up` 处理短暂空洞，仍不碰断点文件。
+2. **增量默认追平**: `sync` 循环拉取直到本批没有更新的 seqno；仍不碰断点文件。
 3. **size 默认 20、上限 200**: 接口最大 2000，但大 size 易触发 412；200 作为程序硬顶。
 4. **请求间隔默认 1.5 秒**: 低于该值视为高风险，配置允许调大不允许在代码里写死 0。
 5. **图片失败不阻断入库**: 图片 URL 有时效，文本与 raw_content 才是可长期保留的最小完整记录。
 6. **Python + sqlite3**: 标准库即可支撑 10 万行；避免为个人工具引入服务端框架。
-7. **UTC 桶划分**: 使用 timestamp 的 UTC 日期，保证跨机器备份路径一致。若接手已有本地时区存档，需按原实现对齐算法后再跑。
-8. **v1 不做多会话管理 / 重试队列 / 代理 / 导出**: 需求允许后续加；本设计把 `talker_id` 参数化，存储已按 talker 建索引。
+7. **UTC 日历旬**: 按 UTC 年月日切 `01-10` / `11-20` / `21-月末`，路径落在仓库根，方便 Actions 回写。
+8. **v1 只记录**: 不做查阅、导出、代理、图片重试队列、多会话管理。
+9. **存档进 Git**: db 与图片提交回仓库；`SESSDATA` 只用 GitHub Secrets。
 
 ## References
 

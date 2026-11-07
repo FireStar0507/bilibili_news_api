@@ -2,11 +2,11 @@
 
 ## Introduction
 
-本系统是面向个人学习测试的 B 站单会话私信本地归档工具。系统通过 B 站官方私信接口 `fetch_session_msgs` 拉取同一会话的私信，将消息元数据持久化到 SQLite，将图片按固定日期分层目录落地到本地，使 B 站服务不可访问时仍可查阅存档。
+本系统是面向个人学习测试的 B 站单会话私信本地归档工具。系统通过 B 站官方私信接口 `fetch_session_msgs` 拉取同一会话的私信，将消息元数据持久化到仓库内 SQLite，将图片按年/月/旬目录写入仓库。v1 只负责记录与回写，不实现查阅界面。
 
-系统采用双轨同步模型：增量同步高频轻量收录新消息；回溯补历史低频分批补齐更早消息。两条流程互相独立。系统必须兼容既定存档规范（数据库表结构、图片桶命名、断点文件结构），保证旧存档可继续使用。
+系统采用双轨同步模型：增量同步追平本地最大 seqno 之后的全部新消息；回溯补历史低频分批补齐更早消息。两条流程互相独立。GitHub Actions 每日运行增量同步，将数据库、图片、断点提交回仓库。
 
-本系统仅用于归档当前登录账号与指定会话对象之间的私信，规模目标为 10 万条以上消息。
+本系统仅用于归档当前登录账号与指定会话对象之间的私信，规模目标为 10 万条以上消息。本仓库无旧存档，图片目录采用新分层规则。
 
 ## Glossary
 
@@ -21,9 +21,9 @@
 - **SESSDATA**: B 站身份 Cookie。过期后接口返回 `-101`。
 - **msg_type**: 消息类型。`1` 为文本，`2` 为图片。其他类型 content 结构不固定。
 - **msg_status**: 消息状态。`0` 正常，`1` 撤回（接口仍返回撤回内容），`2` 系统撤回，`50` 图片已失效。
-- **Archive Set / 完整存档备份集合**: `bilibili_msg_archive.db`、`msg_images/` 目录、`resume_point.json` 三者组成的完整备份。
-- **Image Bucket / 图片存储桶**: 以消息 `timestamp` 计算、每 10 天一个文件夹，命名格式 `YYYY-MM-DD~YYYY-MM-DD`。
-- **Incremental Sync / 增量同步**: 高频轻量流程。读取本地当前会话最大 `seqno`，拉取最新一批消息，仅入库更大的新增消息。不读写 `resume_point.json`。
+- **Archive Set / 完整存档备份集合**: 仓库内 `bilibili_msg_archive.db`、按年/月/旬存放的图片目录、`resume_point.json` 三者组成的完整备份。
+- **Image Bucket / 图片存储桶**: 以消息 `timestamp` 的 UTC 日期计算。路径 `{YYYY}/{MM}/{DD-DD}`，每月三个旬：`01-10`、`11-20`、`21-{月末日}`。月末不足十日并入下旬。
+- **Incremental Sync / 增量同步**: 读取本地当前会话最大 `seqno`，循环拉取最新消息直到本批已无更大 seqno，仅入库更大的新增消息。不读写 `resume_point.json`。
 - **Backfill / 回溯补历史**: 低频分批流程。读取 `resume_point.json`，按批次向前拉取更早消息，每批写入断点，支持 `max_round` 限制。
 - **Rate Limit Interval / 请求间隔**: 相邻两次接口请求之间的最短等待时间，用于规避 B 站 412 风控。
 
@@ -38,8 +38,8 @@
 1. WHEN 使用者提供有效的 `SESSDATA`、`talker_id` 与 `session_type`, THE 归档系统 SHALL 仅拉取该会话的私信。
 2. THE 归档系统 SHALL 将消息元数据写入 SQLite 数据库文件 `bilibili_msg_archive.db`。
 3. THE 归档系统 SHALL 将图片文件写入本地目录 `msg_images/`。
-4. WHEN B 站接口不可访问, THE 归档系统 SHALL 允许使用者仅凭本地 `bilibili_msg_archive.db` 与 `msg_images/` 查阅已入库消息。
-5. THE 归档系统 SHALL 将用途限定为当前登录账号的个人学习测试。
+4. THE 归档系统 SHALL 将用途限定为当前登录账号的个人学习测试。
+5. v1 THE 归档系统 SHALL 只实现记录、下载与回写，不实现查阅界面。
 
 ### Requirement 2: 固化存档数据规范
 
@@ -49,10 +49,10 @@
 
 1. THE 归档系统 SHALL 使用表名 `private_messages`，主键为 `seqno INTEGER PRIMARY KEY`。
 2. THE 归档系统 SHALL 在 `private_messages` 中包含且仅依赖以下字段：`seqno, talker_id, sender_uid, timestamp, msg_type, msg_status, content_text, raw_content, image_local_path, created_at`。
-3. WHEN 归档系统计算图片目录, THE 归档系统 SHALL 以消息 `timestamp` 划分每 10 天一个存储桶，文件夹命名格式为 `YYYY-MM-DD~YYYY-MM-DD`。
-4. WHEN 归档系统保存图片文件, THE 归档系统 SHALL 使用文件名 `{seqno}.后缀`，并在 `image_local_path` 中存储相对路径。
+3. WHEN 归档系统计算图片目录, THE 归档系统 SHALL 使用相对仓库根的路径 `{YYYY}/{MM}/{DD-DD}/{seqno}.后缀`。旬划分为 `01-10`、`11-20`、`21-{该月最后一天}`。
+4. WHEN 归档系统保存图片文件, THE 归档系统 SHALL 使用文件名 `{seqno}.后缀`，并在 `image_local_path` 中存储上述相对路径。
 5. THE 归档系统 SHALL 将断点文件命名为 `resume_point.json`，其 key 为字符串类型 `talker_id`，value 包含 `last_begin_seqno` 与 `has_finished`。
-6. WHEN 使用者备份完整存档, THE 归档系统 SHALL 将 `bilibili_msg_archive.db`、`msg_images/`、`resume_point.json` 视为缺一不可的备份集合。
+6. WHEN 使用者备份完整存档, THE 归档系统 SHALL 将 `bilibili_msg_archive.db`、年/月/旬图片目录、`resume_point.json` 视为缺一不可的备份集合。
 
 ### Requirement 3: 消息去重与时序查询
 
@@ -74,8 +74,9 @@
 1. WHEN 增量同步启动, THE 归档系统 SHALL 读取本地当前会话已入库消息的最大 `seqno`。
 2. WHEN 本地当前会话尚无消息, THE 归档系统 SHALL 将本地最大 `seqno` 视为 0 并拉取最新一批消息。
 3. WHEN 增量同步收到一批消息, THE 归档系统 SHALL 仅入库 `seqno` 大于本地最大 `seqno` 的消息。
-4. THE 增量同步流程 SHALL 独立于回溯补历史流程运行。
-5. THE 增量同步流程 SHALL 在运行期间保持不读写 `resume_point.json`。
+4. WHILE 本批仍存在 `seqno` 大于本地最大 `seqno` 的消息, THE 归档系统 SHALL 继续拉取下一批并更新本地最大 `seqno`，直到本批全部不大于本地最大 `seqno` 或本批为空。
+5. THE 增量同步流程 SHALL 独立于回溯补历史流程运行。
+6. THE 增量同步流程 SHALL 在运行期间保持不读写 `resume_point.json`。
 
 ### Requirement 5: 回溯补历史与断点续跑
 
@@ -126,14 +127,14 @@
 3. WHEN 接口返回 `code=0` 且 `messages` 为空或 `null`, THE 归档系统 SHALL 将该次请求视为无新消息并正常结束本轮拉取。
 4. IF 单次请求网络失败, THE 归档系统 SHALL 按可配置次数重试，重试耗尽后停止当前流程并保留已写入的数据和断点。
 
-### Requirement 9: 本地查阅
+### Requirement 9: GitHub Actions 每日回写
 
-**User Story:** AS 个人使用者, I want 在本地按时间顺序阅读已归档的文本和图片, so that 不依赖 B 站在线服务也能查看该会话。
+**User Story:** AS 个人使用者, I want 每天由 GitHub Actions 自动跑增量同步并把结果提交回仓库, so that 存档随仓库一起保存，数据库仍是仓库内的本地 SQLite 文件。
 
 #### Acceptance Criteria
 
-1. WHEN 使用者启动本地查阅, THE 归档系统 SHALL 按 `ORDER BY seqno ASC` 展示指定 `talker_id` 的已入库消息。
-2. WHEN 一条消息存在非空 `content_text`, THE 归档系统 SHALL 展示该文本。
-3. WHEN 一条消息存在非空 `image_local_path` 且对应文件存在, THE 归档系统 SHALL 展示该本地图片。
-4. WHEN 一条消息仅有 `raw_content`, THE 归档系统 SHALL 展示原始 content 文本。
-5. WHEN 一条消息 `msg_status=1`, THE 归档系统 SHALL 在展示时标明该消息为撤回消息。
+1. THE 归档系统 SHALL 提供 GitHub Actions 工作流，按 cron 每天至少运行一次增量同步。
+2. WHEN Actions 运行, THE 归档系统 SHALL 从 GitHub Secrets 读取 `SESSDATA`，并从仓库检出已有的 `bilibili_msg_archive.db`、图片目录与 `resume_point.json`。
+3. WHEN 增量同步结束且工作区有变更, THE 归档系统 SHALL 将数据库、新增图片与相关文件提交并推回同一仓库。
+4. WHEN `SESSDATA` 缺失或接口返回 `-101`, THE Actions 作业 SHALL 以失败结束且不强制清空已有存档。
+5. THE Actions 每日作业 SHALL 默认只跑增量同步；回溯补历史由手动 `workflow_dispatch` 触发并遵守 `max_round`。
