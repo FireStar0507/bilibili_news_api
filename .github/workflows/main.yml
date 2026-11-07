@@ -1,0 +1,69 @@
+name: archive-sync
+
+on:
+  schedule:
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "sync or backfill"
+        required: true
+        default: "sync"
+        type: choice
+        options:
+          - sync
+          - backfill
+      max_round:
+        description: "backfill max_round"
+        required: false
+        default: "10"
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run archive
+        env:
+          BILI_SESSDATA: ${{ secrets.BILI_SESSDATA }}
+          BILI_TALKER_ID: ${{ secrets.BILI_TALKER_ID }}
+          BILI_SESSION_TYPE: ${{ secrets.BILI_SESSION_TYPE }}
+          BILI_SIZE: ${{ secrets.BILI_SIZE }}
+          BILI_REQUEST_INTERVAL: ${{ secrets.BILI_REQUEST_INTERVAL }}
+          BILI_MAX_ROUND: ${{ github.event.inputs.max_round || '10' }}
+          BILI_ARCHIVE_DIR: "."
+        run: |
+          set -euo pipefail
+          if [ -z "${BILI_SESSDATA:-}" ] || [ -z "${BILI_TALKER_ID:-}" ]; then
+            echo "missing secrets BILI_SESSDATA or BILI_TALKER_ID"
+            exit 1
+          fi
+          JOB="${{ github.event.inputs.job || 'sync' }}"
+          if [ "$JOB" = "backfill" ]; then
+            python -m src.cli backfill --max-round "${BILI_MAX_ROUND}"
+          else
+            python -m src.cli sync
+          fi
+
+      - name: Commit archive back
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no archive changes"
+            exit 0
+          fi
+          git commit -m "chore(archive): daily sync $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
